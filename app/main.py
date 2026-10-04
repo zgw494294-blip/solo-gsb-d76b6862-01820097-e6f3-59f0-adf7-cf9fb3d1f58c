@@ -582,13 +582,72 @@ def get_furnace_plan():
 @app.put("/api/furnace-plan")
 def submit_furnace_plan(payload: PlanSubmitIn):
     # 整批查看后提交：未提及项保留；未知炉次 404，未归档 422，版本过期或
-    # 排段重叠 409；任何失败都不改变计划。成功整批写入、version +1 并返回
+    # 排段重叠 409；改时或移除**进行中项**、把**已结束项**重新排入同样整批
+    # 拒绝（409）。任何失败都不改变计划。成功整批写入、version +1 并返回
     # 完整计划。时长取归档冻结曲线档数 × 5 分钟，不读当前配方或重新求解。
     try:
         return store.submit_furnace_plan(
             payload.version,
             [(item.draft_id, item.start_minute) for item in payload.changes],
         )
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+# ---------------- 开炉 / 结束登记（仅 HTTP 登记，不控制设备） ----------------
+
+
+class FurnaceStartIn(BaseModel):
+    # 要开炉的炉次 ID（严格整数；存在与否由 store 判 404）
+    draft_id: StrictInteger = Field(alias="draftId")
+    # 所读计划 version：已变化则 409（空计划版本为 1）
+    version: StrictInteger = Field(ge=1)
+    # 实际开始分钟：SQLite 可存的非负整数 Unix 分钟（语义下限由 store 判 422）
+    actual_start_minute: NonNegativeMinute = Field(alias="actualStartMinute")
+
+    model_config = {"populate_by_name": True}
+
+
+class FurnaceEndIn(BaseModel):
+    # 进行中的炉次 ID（严格整数；未知 404，未开炉 / 已结束 409）
+    draft_id: StrictInteger = Field(alias="draftId")
+    # 结束分钟：非负整数 Unix 分钟，不得早于本次实际开始（store 判 422）
+    end_minute: NonNegativeMinute = Field(alias="endMinute")
+
+    model_config = {"populate_by_name": True}
+
+
+@app.get("/api/furnace-runs")
+def get_furnace_runs():
+    # 按开炉顺序（实际开始分钟、炉次 ID）读取全部登记记录与当前占炉：
+    # 每条含炉次 ID、计划起止、实际起止与状态（running/ended），未结束时
+    # actualEndMinute 为 null；current 为当前占炉，炉空为 null。
+    return store.list_furnace_runs()
+
+
+@app.post("/api/furnace-plan/start")
+def start_furnace_run(payload: FurnaceStartIn):
+    # 登记开炉（不控制设备）：只能启动计划首项；每炉次仅执行一次，同时仅
+    # 一项进行中；实际开始不早于计划开始与上次实际结束。保存计划起止快照，
+    # 计划 version +1（保留计划项、不挪动后续）。版本过期 / 状态冲突 409
+    # （前者附 currentVersion）、未知炉次 404、未归档 / 非法分钟 422；
+    # 任何失败都不改变状态。
+    try:
+        return store.start_furnace_run(
+            payload.draft_id, payload.version, payload.actual_start_minute
+        )
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.post("/api/furnace-plan/end")
+def end_furnace_run(payload: FurnaceEndIn):
+    # 登记结束（不控制设备）：保存结束记录、释放占炉、移除计划项与计划
+    # version +1 在同一事务一起生效，不自动挪动后续计划。未知炉次 404，
+    # 未开炉 / 已结束 409，结束分钟非法（负数由模型拦截、早于本次开始由
+    # store 判）422；任何失败都不改变状态。
+    try:
+        return store.end_furnace_run(payload.draft_id, payload.end_minute)
     except store.StoreError as exc:
         _raise_store_error(exc)
 

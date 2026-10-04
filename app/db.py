@@ -126,6 +126,28 @@ CREATE TABLE IF NOT EXISTS furnace_plan_entries (
     updated_at    TEXT    NOT NULL,
     FOREIGN KEY (draft_id) REFERENCES drafts(id)
 );
+
+-- 开炉 / 结束登记（经 HTTP 记录，不控制任何设备）：每个炉次至多一条
+-- （draft_id 唯一，重复开炉 409）；status='running' 的记录全表至多一条
+-- （部分唯一索引保证同时仅一项进行中）。开炉时快照计划起止分钟，结束
+-- 写入实际结束分钟并置 'ended'。时间一律为非负整数 Unix 分钟。
+-- 随现有 SQLite 卷持久化；旧库启动时由 CREATE TABLE IF NOT EXISTS /
+-- CREATE UNIQUE INDEX IF NOT EXISTS 自动初始化为空（无记录、炉空）。
+CREATE TABLE IF NOT EXISTS furnace_runs (
+    draft_id          INTEGER PRIMARY KEY,
+    status            TEXT    NOT NULL CHECK (status IN ('running', 'ended')),
+    plan_start_minute INTEGER NOT NULL,
+    plan_end_minute   INTEGER NOT NULL,
+    actual_start_minute INTEGER NOT NULL,
+    actual_end_minute   INTEGER,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL,
+    FOREIGN KEY (draft_id) REFERENCES drafts(id)
+);
+
+-- 同时仅一项进行中：仅 running 行参与唯一约束，ended 行不占位
+CREATE UNIQUE INDEX IF NOT EXISTS idx_furnace_runs_running
+    ON furnace_runs(status) WHERE status = 'running';
 """
 
 

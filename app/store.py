@@ -1171,9 +1171,42 @@ def submit_furnace_plan(
             existing = conn.execute(
                 "SELECT draft_id, start_minute FROM furnace_plan_entries"
             ).fetchall()
-            merged: dict[int, int] = {
+            existing_starts: dict[int, int] = {
                 r["draft_id"]: r["start_minute"] for r in existing
             }
+            merged: dict[int, int] = dict(existing_starts)
+
+            # 进行中炉次（status='running'，全表至多一条）：其计划项必须原样
+            # 保留——本批改时（非 null 且与当前开始不同）或移除（null）一律
+            # 整批拒绝；已结束炉次的计划项在结束时已移除，不得用非 null 改动
+            # 重新排入（null 移除一个本就不在计划中的已结束炉次为空操作）。
+            running_row = conn.execute(
+                "SELECT draft_id FROM furnace_runs WHERE status='running'"
+            ).fetchone()
+            running_id = running_row["draft_id"] if running_row is not None else None
+            ended_ids = {
+                r["draft_id"]
+                for r in conn.execute(
+                    "SELECT draft_id FROM furnace_runs WHERE status='ended'"
+                ).fetchall()
+            }
+            for draft_id, start in changes:
+                if draft_id == running_id:
+                    if start is None:
+                        raise Conflict(
+                            f"炉次 {draft_id} 正在进行中，整批改动不得移除进行中项，"
+                            f"请先结束该炉次。"
+                        )
+                    if existing_starts.get(draft_id) != start:
+                        raise Conflict(
+                            f"炉次 {draft_id} 正在进行中，整批改动不得修改其计划"
+                            f"开始时间，请先结束该炉次。"
+                        )
+                if start is not None and draft_id in ended_ids:
+                    raise Conflict(
+                        f"炉次 {draft_id} 已结束，已结束炉次不得重新排入计划。"
+                    )
+
             for draft_id, start in changes:
                 if start is None:
                     merged.pop(draft_id, None)
@@ -1237,3 +1270,263 @@ def submit_furnace_plan(
 
         # 提交完成后从库内重读完整计划（复用同一连接，保证与写入严格一致）
         return {"version": _plan_version(conn), "items": _plan_items(conn)}
+
+
+# ---------------- 开炉 / 结束登记（仅 HTTP 登记，不控制设备） ----------------
+
+
+def _first_plan_item(conn) -> dict | None:
+    """当前计划首项（按开始分钟、炉次 ID 升序）的炉次 ID 与计划起止分钟。
+
+    计划为空返回 None。时长取归档冻结曲线档数 × 5 分钟，与 _plan_items 同源。
+    """
+    row = conn.execute(
+        """SELECT p.draft_id AS draft_id, p.start_minute AS start_minute,
+                  a.result_json AS result_json
+           FROM furnace_plan_entries p
+           JOIN archives a ON a.draft_id = p.draft_id
+           ORDER BY p.start_minute, p.draft_id
+           LIMIT 1"""
+    ).fetchone()
+    if row is None:
+        return None
+    steps = len(json.loads(row["result_json"])["temperatures"])
+    return {
+        "draftId": row["draft_id"],
+        "planStartMinute": row["start_minute"],
+        "planEndMinute": row["start_minute"] + steps * 5,
+    }
+
+
+def _run_dict(row) -> dict:
+    return {
+        "draftId": row["draft_id"],
+        "planStartMinute": row["plan_start_minute"],
+        "planEndMinute": row["plan_end_minute"],
+        "actualStartMinute": row["actual_start_minute"],
+        "actualEndMinute": row["actual_end_minute"],
+        "status": row["status"],
+    }
+
+
+def start_furnace_run(
+    draft_id: int, expected_version: int, actual_start: int
+) -> dict:
+    """按所读计划版本登记开炉（不控制任何设备）。
+
+    只能启动计划首项；每炉次至多执行一次（已有 running/ended 记录 409）；
+    同时仅一项进行中（存在 running 记录 409）。实际开始为 SQLite 可存的
+    非负整数 Unix 分钟，且不早于计划开始与上次实际结束（不满足 422）。
+    成功保存计划起止快照、写入 running 记录，并与计划 version +1 一起生效
+    （不删除计划项、不挪动后续排段）。未知炉次 404、未归档 422、版本过期
+    409。任何失败均在 COMMIT 前抛错回滚，不改变任何状态。
+    """
+    now = _now()
+    with write_lock(), lock(), connect() as conn:
+        with _tx(conn):
+            current_version = _plan_version(conn)
+            if current_version != expected_version:
+                raise Conflict(
+                    f"开炉计划已过期：你查看的是版本 {expected_version}，"
+                    f"当前为版本 {current_version}，请重新读取后再开炉。",
+                    current_version,
+                )
+
+            # 引用炉次必须存在且已归档：未知 => 404，未归档 => 422；
+            # 超出 SQLite 有符号 64 位整数范围、无法绑定查询的 ID 按未知处理。
+            if not (_SQLITE_INT_MIN <= draft_id <= _SQLITE_INT_MAX):
+                raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+            r = conn.execute(
+                """SELECT d.id AS id, a.id AS archive_id
+                   FROM drafts d
+                   LEFT JOIN archives a ON a.draft_id = d.id
+                   WHERE d.id = ?""",
+                (draft_id,),
+            ).fetchone()
+            if r is None:
+                raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+            if r["archive_id"] is None:
+                raise Unprocessable(
+                    f"炉次 {draft_id} 尚未归档，只有已归档且排入计划首项的炉次"
+                    f"才能开炉。"
+                )
+
+            # 每炉次仅执行一次（已有任意状态记录）409；同时仅一项进行中 409。
+            # 先于「是否计划首项」判定，保证对已开 / 已结束炉次给出准确原因。
+            run = conn.execute(
+                "SELECT status FROM furnace_runs WHERE draft_id=?", (draft_id,)
+            ).fetchone()
+            if run is not None:
+                if run["status"] == "running":
+                    raise Conflict(f"炉次 {draft_id} 已在进行中，不能重复开炉。")
+                raise Conflict(f"炉次 {draft_id} 已结束，每炉次只能执行一次。")
+            running = conn.execute(
+                "SELECT draft_id FROM furnace_runs WHERE status='running'"
+            ).fetchone()
+            if running is not None:
+                raise Conflict(
+                    f"炉次 {running['draft_id']} 尚在进行中，同一时间只能有一项"
+                    f"进行中，请先结束该炉次。"
+                )
+
+            # 只能启动计划首项；空计划 / 不是首项 => 409
+            first = _first_plan_item(conn)
+            if first is None:
+                raise Conflict("当前开炉计划为空，没有可开炉的计划项。")
+            if first["draftId"] != draft_id:
+                raise Conflict(
+                    f"只能启动计划首项：当前首项为炉次 {first['draftId']}，"
+                    f"炉次 {draft_id} 不能开炉。"
+                )
+
+            # 时间：必须能原样存入 SQLite（非负有符号 64 位整数；路由层已以
+            # 严格类型拒绝布尔 / 小数 / 字符串，这里再兜范围，不截断不转浮点）
+            if not (0 <= actual_start <= _SQLITE_INT_MAX):
+                raise Unprocessable(
+                    f"实际开始分钟 {actual_start} 超出可存储范围"
+                    f"（0～{_SQLITE_INT_MAX}），请提供非负整数。"
+                )
+            if actual_start < first["planStartMinute"]:
+                raise Unprocessable(
+                    f"实际开始分钟 {actual_start} 早于计划开始 "
+                    f"{first['planStartMinute']}，不允许提前开炉。"
+                )
+            last_end_row = conn.execute(
+                """SELECT actual_end_minute FROM furnace_runs
+                   WHERE status='ended'
+                   ORDER BY actual_end_minute DESC, draft_id
+                   LIMIT 1"""
+            ).fetchone()
+            if last_end_row is not None and actual_start < last_end_row[0]:
+                raise Unprocessable(
+                    f"实际开始分钟 {actual_start} 早于上一炉次实际结束 "
+                    f"{last_end_row[0]}，不允许开炉。"
+                )
+
+            conn.execute(
+                """INSERT INTO furnace_runs
+                       (draft_id, status, plan_start_minute, plan_end_minute,
+                        actual_start_minute, actual_end_minute,
+                        created_at, updated_at)
+                   VALUES (?, 'running', ?, ?, ?, NULL, ?, ?)""",
+                (
+                    draft_id,
+                    first["planStartMinute"],
+                    first["planEndMinute"],
+                    actual_start,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO furnace_plan_meta (id, version)
+                   VALUES (1, ?)
+                   ON CONFLICT(id) DO UPDATE SET version=excluded.version""",
+                (current_version + 1,),
+            )
+
+        saved = conn.execute(
+            "SELECT * FROM furnace_runs WHERE draft_id=?", (draft_id,)
+        ).fetchone()
+        return {
+            "version": _plan_version(conn),
+            "current": _current_occupancy(conn),
+            "run": _run_dict(saved),
+        }
+
+
+def end_furnace_run(draft_id: int, actual_end: int) -> dict:
+    """登记进行中炉次的结束（不控制任何设备）。
+
+    保存实际结束分钟、释放占炉、从计划移除该炉次项与计划 version +1 在
+    **同一事务**里一起生效；不自动挪动后续计划。结束分钟为 SQLite 可存
+    的非负整数 Unix 分钟，且不早于本次实际开始（否则 422）。未知炉次
+    404；炉次无进行中记录（未开炉或已结束）409。任何失败均回滚，不改变
+    任何状态。
+    """
+    now = _now()
+    with write_lock(), lock(), connect() as conn:
+        with _tx(conn):
+            if not (_SQLITE_INT_MIN <= draft_id <= _SQLITE_INT_MAX):
+                raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+            run = conn.execute(
+                """SELECT r.draft_id AS draft_id, r.status AS status,
+                          r.actual_start_minute AS actual_start_minute
+                   FROM drafts d
+                   LEFT JOIN furnace_runs r ON r.draft_id = d.id
+                   WHERE d.id = ?""",
+                (draft_id,),
+            ).fetchone()
+            # run 为 None：drafts 里没有该炉次（LEFT JOIN 无右行）=> 404
+            if run is None:
+                raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+            if run["status"] is None:
+                raise Conflict(f"炉次 {draft_id} 尚未开炉，无法结束。")
+            if run["status"] == "ended":
+                raise Conflict(f"炉次 {draft_id} 已结束，不能重复结束。")
+
+            if not (0 <= actual_end <= _SQLITE_INT_MAX):
+                raise Unprocessable(
+                    f"结束分钟 {actual_end} 超出可存储范围"
+                    f"（0～{_SQLITE_INT_MAX}），请提供非负整数。"
+                )
+            if actual_end < run["actual_start_minute"]:
+                raise Unprocessable(
+                    f"结束分钟 {actual_end} 早于本次实际开始 "
+                    f"{run['actual_start_minute']}，结束不得早于开始。"
+                )
+
+            # 保存记录、释放占炉（status='ended'）、移除计划项、version +1
+            # 四者在同一事务内一起生效；不自动挪动后续排段
+            conn.execute(
+                """UPDATE furnace_runs
+                   SET status='ended', actual_end_minute=?, updated_at=?
+                   WHERE draft_id=?""",
+                (actual_end, now, draft_id),
+            )
+            conn.execute(
+                "DELETE FROM furnace_plan_entries WHERE draft_id=?", (draft_id,)
+            )
+            current_version = _plan_version(conn)
+            conn.execute(
+                """INSERT INTO furnace_plan_meta (id, version)
+                   VALUES (1, ?)
+                   ON CONFLICT(id) DO UPDATE SET version=excluded.version""",
+                (current_version + 1,),
+            )
+
+        saved = conn.execute(
+            "SELECT * FROM furnace_runs WHERE draft_id=?", (draft_id,)
+        ).fetchone()
+        return {
+            "version": _plan_version(conn),
+            "current": _current_occupancy(conn),
+            "run": _run_dict(saved),
+        }
+
+
+def _current_occupancy(conn) -> dict | None:
+    """当前占炉（全表至多一条 running 记录）；炉空时为 None。"""
+    row = conn.execute(
+        "SELECT * FROM furnace_runs WHERE status='running'"
+    ).fetchone()
+    return _run_dict(row) if row is not None else None
+
+
+def list_furnace_runs() -> dict:
+    """按开炉顺序（实际开始分钟、炉次 ID）读取全部登记记录与当前占炉。
+
+    返回计划 version、records（每条含炉次 ID、计划起止、实际起止与状态；
+    未结束时 actualEndMinute 为 null）与 current（当前占炉，炉空为 null）。
+    只读，持全局读锁，看到的永远是某一整次提交后的自洽状态。
+    """
+    with lock(), connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM furnace_runs
+               ORDER BY actual_start_minute, draft_id"""
+        ).fetchall()
+        return {
+            "version": _plan_version(conn),
+            "current": _current_occupancy(conn),
+            "records": [_run_dict(r) for r in rows],
+        }
