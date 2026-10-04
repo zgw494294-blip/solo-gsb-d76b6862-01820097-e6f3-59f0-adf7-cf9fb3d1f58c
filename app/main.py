@@ -584,10 +584,72 @@ def submit_furnace_plan(payload: PlanSubmitIn):
     # 整批查看后提交：未提及项保留；未知炉次 404，未归档 422，版本过期或
     # 排段重叠 409；任何失败都不改变计划。成功整批写入、version +1 并返回
     # 完整计划。时长取归档冻结曲线档数 × 5 分钟，不读当前配方或重新求解。
+    # 进行中炉次的计划项不得改时或移除（409），已结束炉次不得重新排入
+    # （409）。
     try:
         return store.submit_furnace_plan(
             payload.version,
             [(item.draft_id, item.start_minute) for item in payload.changes],
+        )
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+# ---------------- 开炉 / 结束登记（仅登记，不控制设备） ----------------
+
+
+class FurnaceStartIn(BaseModel):
+    # 要开炉的炉次 ID：必须是当前计划首项（按开始分钟、炉次 ID 排序）
+    draft_id: StrictInteger = Field(alias="draftId")
+    # 提交计划时读到的计划版本：已变化则 409（空计划版本为 1）
+    version: StrictInteger = Field(ge=1)
+    # 实际开始分钟：SQLite 可存的非负整数 Unix 分钟；不得早于计划开始及
+    # 上次实际结束（语义校验在 store 内，非法返回 422）
+    actual_start_minute: NonNegativeMinute = Field(alias="actualStartMinute")
+
+    model_config = {"populate_by_name": True}
+
+
+class FurnaceFinishIn(BaseModel):
+    # 要结束的进行中炉次 ID
+    draft_id: StrictInteger = Field(alias="draftId")
+    # 实际结束分钟：不得早于本次实际开始（语义校验在 store 内）
+    actual_end_minute: NonNegativeMinute = Field(alias="actualEndMinute")
+
+    model_config = {"populate_by_name": True}
+
+
+@app.get("/api/furnace-runs")
+def get_furnace_runs():
+    # 按开炉顺序读取全部执行记录及当前占炉：current 为进行中记录或 null，
+    # runs 含炉次 ID、计划起止、实际起止与状态；未结束时 actualEndMinute
+    # 为 null
+    return store.list_furnace_runs()
+
+
+@app.post("/api/furnace-runs/start", status_code=201)
+def start_furnace_run(payload: FurnaceStartIn):
+    # 开炉登记（不控制设备）：只能启动计划首项；每炉次仅执行一次，同时仅
+    # 一项进行中。成功保存 running 记录（冻结计划起止）、计划 version +1。
+    # 旧版本 / 非首项 / 已有进行中 / 该炉次已执行过 => 409，未知炉次 =>
+    # 404，非法分钟（早于计划开始或上次实际结束等）=> 422；失败不改状态。
+    try:
+        return store.start_furnace_run(
+            payload.draft_id, payload.version, payload.actual_start_minute
+        )
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.post("/api/furnace-runs/finish")
+def finish_furnace_run(payload: FurnaceFinishIn):
+    # 结束登记（不控制设备）：保存结束记录、释放占炉、移除计划项与计划
+    # version +1 在同一事务一起生效，不自动挪动后续计划。未知炉次 => 404，
+    # 未开炉 / 已结束等状态冲突 => 409，结束分钟早于本次开始 => 422；
+    # 失败不改状态。
+    try:
+        return store.finish_furnace_run(
+            payload.draft_id, payload.actual_end_minute
         )
     except store.StoreError as exc:
         _raise_store_error(exc)

@@ -126,6 +126,29 @@ CREATE TABLE IF NOT EXISTS furnace_plan_entries (
     updated_at    TEXT    NOT NULL,
     FOREIGN KEY (draft_id) REFERENCES drafts(id)
 );
+
+-- 开炉 / 结束登记（仅经 HTTP 登记，不控制设备）：每个炉次至多一条执行记录
+-- （draft_id 唯一，落实「每炉次仅执行一次」）；status='running' 进行中
+-- （全表至多一条，由写互斥锁 + 单条事务保证「同时仅一项进行中」），
+-- 'finished' 已结束（计划项已移除且不得重新排入）。开炉时冻结当时的计划
+-- 起止（plan_end = plan_start + 归档冻结曲线档数 × 5）；实际起止均为
+-- SQLite 可存的非负整数 Unix 分钟，未结束时 actual_end_minute 为 NULL。
+-- 随现有 SQLite 卷跨重启保留；旧库启动时由 CREATE TABLE IF NOT EXISTS
+-- 自动初始化为空表（无正在占炉的炉次）。
+CREATE TABLE IF NOT EXISTS furnace_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id            INTEGER NOT NULL UNIQUE,
+    plan_start_minute   INTEGER NOT NULL,
+    plan_end_minute     INTEGER NOT NULL,
+    actual_start_minute INTEGER NOT NULL,
+    actual_end_minute   INTEGER,
+    status              TEXT NOT NULL CHECK (status IN ('running','finished')),
+    -- 开炉时所读（也即所基于）的计划版本
+    plan_version        INTEGER NOT NULL,
+    started_at          TEXT NOT NULL,
+    ended_at            TEXT,
+    FOREIGN KEY (draft_id) REFERENCES drafts(id)
+);
 """
 
 

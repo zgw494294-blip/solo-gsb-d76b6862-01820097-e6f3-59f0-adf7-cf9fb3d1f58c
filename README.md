@@ -12,7 +12,9 @@
   配方 / 炉次 / 归档 / 作废用 SQLite 持久化，见 `app/db.py`、`app/store.py`；
   已归档炉次只读电费试算见 `app/electricity.py`，原曲线复用只读核验见
   `app/reuse.py`，归档快照离线 HTML 工艺单导出见 `app/exports.py`；
-  单台炉已归档炉次开炉计划见 `GET/PUT /api/furnace-plan`）
+  单台炉已归档炉次开炉计划见 `GET/PUT /api/furnace-plan`，计划首项的
+  开炉 / 结束登记（不控制设备）见
+  `GET /api/furnace-runs`、`POST /api/furnace-runs/start|finish`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
   页面分为「编排求解 / 材料配方 / 炉次草稿」三个标签页；已归档炉次详情中
   含原曲线复用检查、电费试算卡片与单份 HTML 工艺单下载）
@@ -333,7 +335,10 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | POST | `/api/drafts/{id}/electricity` | 已归档炉次电费试算（只读冻结曲线，不保存；未知 404 / 未归档或参数非法 422） |
 | GET | `/api/drafts/{id}/sheet` | 下载已归档炉次的单份离线 HTML 工艺单（UTF-8 HTML 附件；未知 404 / 未归档 422；只读归档快照，不写库） |
 | GET | `/api/furnace-plan` | 读取单台炉开炉计划（version + 排段，按开始分钟、ID 排序；空计划版本 1） |
-| PUT | `/api/furnace-plan` | 批量提交 1～20 项改动（非负整数 Unix 开始分钟，null 移除，未提及保留；同批可交换；版本过期/重叠 409、未知炉次 404、未归档/非法输入 422；成功整批写入、版本 +1） |
+| PUT | `/api/furnace-plan` | 批量提交 1～20 项改动（非负整数 Unix 开始分钟，null 移除，未提及保留；同批可交换；版本过期/重叠/改时移除进行中项/重排已结束项 409、未知炉次 404、未归档/非法输入 422；成功整批写入、版本 +1） |
+| GET | `/api/furnace-runs` | 按开炉顺序读取执行记录与当前占炉（`current` 进行中记录或 null，`runs` 含炉次 ID、计划起止、实际起止、状态；未结束结束分钟为 null） |
+| POST | `/api/furnace-runs/start` | 开炉登记（不控制设备）：提交炉次 ID、所读计划 version 与实际开始分钟，只能启动计划首项；201；旧 version / 非首项 / 已有进行中 / 每炉次重复执行 409、未知炉次 404、非法分钟 422；成功冻结计划起止、计划 version +1 |
+| POST | `/api/furnace-runs/finish` | 结束登记：提交进行中炉次 ID 与结束分钟；保存记录、释放占炉、移除计划项与计划 version +1 同一事务生效，不挪动后续计划；状态冲突 409、未知炉次 404、结束早于开始 422 |
 
 ### 从零编排（可直接复制执行）
 
@@ -994,7 +999,10 @@ content-disposition: attachment; filename="draft-1-v1-sheet.html";
 状态码（任何失败都**不改变计划、不增加版本**）：
 
 - **409**：版本过期（响应体附 `currentVersion`，重新 GET 后再提交），
-  或改动后存在排段重叠（中文说明冲突的两段炉次与区间）；
+  或改动后存在排段重叠（中文说明冲突的两段炉次与区间）；**进行中炉次**
+  （已开炉未结束）的计划项**不得改时或移除**（覆盖为相同开始分钟属无
+  改动，允许），**已结束炉次不得重新排入**（其计划项已在结束时移除，
+  对它传 `null` 为空操作）；
 - **404**：改动中的炉次 ID 未知（包括超出 SQLite 有符号 64 位整数范围
   `[-9223372036854775808, 9223372036854775807]`、无法入库查询的 ID，如
   `9223372036854775808`，一律按未知炉次处理，不截断、不转浮点）；
@@ -1147,19 +1155,171 @@ curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
   -d '{"version": 3, "changes": [{"draftId": 1, "startMinute": 9223372036854775807}]}'
 ```
 
+## 开炉与结束登记（HTTP 登记，不控制设备）
+
+开炉 / 结束**只做登记**，服务不控制任何设备。登记数据（`furnace_runs`
+表）与计划同在现有 SQLite 卷（`planner-data`）里，**跨重启保留**；旧库
+启动时自动初始化为空（没有正在占炉的炉次）。归档及以上所有 HTTP 合同
+保持不变。
+
+约束：
+
+- **只能启动计划首项**：按开始分钟、再按炉次 ID 排序的第一段；
+- **每炉次仅执行一次**：已结束炉次不能再次开炉，也不能重新排入计划；
+- **同时仅一项进行中**：一炉未结束不能开下一炉；
+- 所有时间都是 **SQLite 可存的非负整数 Unix 分钟**（最大
+  `9223372036854775807`，不截断、不转浮点）；实际开始**不早于计划开始**
+  且**不早于上一炉次的实际结束**；实际结束**不早于本次实际开始**；
+- 开炉成功：写入 `running` 记录并**冻结当时的计划起止**，计划 version
+  **+1**（计划项保留）；
+- 结束成功：保存结束分钟、置 `finished`、**释放占炉**、**移除计划项**与
+  计划 version **+1** 在**同一事务一起生效**，**不自动挪动后续计划**；
+- 开炉、结束与计划修改的并发按**请求先后**串行生效：旧 version 或状态
+  冲突一律 **409**，未知炉次 **404**，非法分钟 **422**；任何失败都**不
+  改状态、不增加版本**。
+
+### 读取记录与当前占炉（可直接复制执行）
+
+```bash
+curl -sS http://localhost:8000/api/furnace-runs
+```
+
+`runs` 按**开炉顺序**（内部自增 ID）返回全部执行记录；`current` 为当前
+进行中记录（至多一条），没有则为 `null`。未结束时 `actualEndMinute` 为
+`null`：
+
+```json
+{
+  "current": {
+    "id": 1,
+    "draftId": 1,
+    "planStartMinute": 29851680,
+    "planEndMinute": 29851700,
+    "actualStartMinute": 29851680,
+    "actualEndMinute": null,
+    "status": "running",
+    "planVersion": 2,
+    "startedAt": "2026-10-04T08:00:00Z",
+    "endedAt": null
+  },
+  "runs": [ /* 同上结构，含已结束记录 */ ]
+}
+```
+
+### 开炉：启动计划首项（可直接复制执行）
+
+请求体：`draftId`（计划首项炉次 ID）、`version`（GET 计划时读到的
+version）、`actualStartMinute`（实际开始 Unix 分钟）：
+
+```bash
+# 先读计划，拿到 version 与首项（假设 version=2，首项为炉次 1，
+# 计划 29851680～29851700；炉次 1、2 此前都未执行过）
+curl -sS http://localhost:8000/api/furnace-plan
+
+curl -sS -i -X POST http://localhost:8000/api/furnace-runs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 1, "version": 2, "actualStartMinute": 29851685}'
+# HTTP/1.1 201 Created
+# {"id":1,"draftId":1,"planStartMinute":29851680,"planEndMinute":29851700,
+#  "actualStartMinute":29851685,"actualEndMinute":null,"status":"running",
+#  "planVersion":2,"startedAt":"...","endedAt":null}
+```
+
+成功后 GET 计划可见**计划项仍在**、version 已 +1（变为 3）。开炉期间
+计划修改受到限制：
+
+```bash
+# 改时 / 移除进行中项：整批拒绝，409，计划与版本不变
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 1, "startMinute": 29851900}]}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"detail":"炉次 1 正在进行中，不能移除或修改其计划开始时间；如需改排，请先结束该炉次。",
+#            "currentVersion":3}}
+
+# 携带开炉前的旧 version / 启动非首项 / 已有进行中再开 / 同一炉次再开：
+curl -sS -i -X POST http://localhost:8000/api/furnace-runs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 2, "version": 2, "actualStartMinute": 29851700}'
+# HTTP/1.1 409 Conflict（version 过期、且炉次 2 不是首项、炉次 1 进行中）
+
+# 实际开始早于计划开始（或早于上一炉次实际结束）：422，不改状态
+curl -sS -i -X POST http://localhost:8000/api/furnace-runs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 1, "version": 3, "actualStartMinute": 29851679}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"实际开始分钟 29851679 早于该炉次的计划开始 29851680，不能提前开炉。"}
+
+# 未知炉次：404
+curl -sS -i -X POST http://localhost:8000/api/furnace-runs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 999, "version": 3, "actualStartMinute": 29851680}'
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 999 不存在。"}
+```
+
+### 结束：保存、释放、移除计划项、版本 +1（可直接复制执行）
+
+请求体只需**进行中炉次 ID** 与 `actualEndMinute`（无需计划 version）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/furnace-runs/finish \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 1, "actualEndMinute": 29851720}'
+# {"id":1,"draftId":1,"planStartMinute":29851680,"planEndMinute":29851700,
+#  "actualStartMinute":29851685,"actualEndMinute":29851720,"status":"finished",
+#  "planVersion":2,"startedAt":"...","endedAt":"..."}
+```
+
+结束后（同一事务）：
+
+- `GET /api/furnace-runs`：该记录 `status=finished`、结束分钟已保存，
+  `current` 回到 `null`（占炉释放，可开下一炉）；
+- `GET /api/furnace-plan`：炉次 1 的计划项已删除、version 再 +1；**后续
+  排段的开始分钟原样保留，不自动挪动**——若上一炉实际拖期导致新首项的
+  计划开始早于上次实际结束，开炉会收到 **422**，需先用 `PUT
+  /api/furnace-plan` 改排（进行中项的限制此时已解除）。
+
+```bash
+# 未开炉就结束 / 重复结束：409；未知炉次：404
+curl -sS -i -X POST http://localhost:8000/api/furnace-runs/finish \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 2, "actualEndMinute": 29851720}'
+# HTTP/1.1 409 Conflict
+# {"detail":"炉次 2 尚未开炉，无法结束。"}
+
+# 结束早于本次实际开始：422，不改状态
+curl -sS -i -X POST http://localhost:8000/api/furnace-runs/finish \
+  -H 'Content-Type: application/json' \
+  -d '{"draftId": 1, "actualEndMinute": 29851684}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"结束分钟 29851684 早于本次实际开始 29851685，结束不能早于开始。"}
+
+# 已结束炉次不能重新排入计划，也不能再次开炉：均为 409
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 4, "changes": [{"draftId": 1, "startMinute": 29852000}]}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"detail":"炉次 1 已经开炉执行并结束，不能重新排入开炉计划。",
+#            "currentVersion":4}}
+```
+
+请求体非法（`version<1`、分钟为负数 / 小数 / 布尔 / 字符串等）按统一
+参数校验返回 **422**，中文说明首个非法字段。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / cancel / 复用检查 / 电费试算 / 工艺单下载 / 单台炉开炉计划）
+│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / cancel / 复用检查 / 电费试算 / 工艺单下载 / 单台炉开炉计划 / 开炉结束登记）
 │   ├── solver.py      # 规则常量、校验与 BFS 求解（配方与草稿复用）
 │   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解）
 │   ├── electricity.py # 已归档炉次电费试算（跨小时/午夜分摊、逐档与总费用舍入）
 │   ├── exports.py     # 已归档炉次单份离线 HTML 工艺单渲染（纯归档快照，样式内嵌）
-│   ├── db.py          # SQLite 连接、建表、全局读锁与写操作互斥锁
-│   └── store.py       # 配方 / 炉次草稿 / 归档 / 作废 / 归档曲线只读 / 复用检查 / 工艺单快照 / 单台炉开炉计划 的事务化读写
+│   ├── db.py          # SQLite 连接、建表（含 furnace_runs 登记表）、全局读锁与写操作互斥锁
+│   └── store.py       # 配方 / 炉次草稿 / 归档 / 作废 / 归档曲线只读 / 复用检查 / 工艺单快照 / 开炉计划 / 开炉结束登记 的事务化读写
 ├── static/
 │   ├── index.html     # 页面（编排求解 / 材料配方 / 炉次草稿 三个标签页）
 │   ├── styles.css     # 样式
